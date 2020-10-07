@@ -2,17 +2,14 @@ package extended
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/pachyderm/pachyderm/src/client/pkg/tracing"
 	col "github.com/pachyderm/pachyderm/src/server/pkg/collection"
 
 	etcd "github.com/coreos/etcd/clientv3"
 	opentracing "github.com/opentracing/opentracing-go"
-	"github.com/opentracing/opentracing-go/ext"
 	"github.com/pachyderm/pachyderm/src/client/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc/metadata"
@@ -62,8 +59,8 @@ func PersistAny(ctx context.Context, c *etcd.Client, pipeline string) {
 		return
 	}
 	// No incoming trace, so nothing to propagate
-	parentSpan := opentracing.SpanFromContext(ctx)
-	if parentSpan == nil {
+	span := opentracing.SpanFromContext(ctx)
+	if span == nil {
 		return
 	}
 
