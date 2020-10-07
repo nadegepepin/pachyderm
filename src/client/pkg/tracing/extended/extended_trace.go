@@ -89,19 +89,13 @@ func PersistAny(ctx context.Context, c *etcd.Client, pipeline string) {
 		duration = defaultDuration
 	}
 
-	// Create trace
-	extendedSpan := opentracing.StartSpan("/pps.API/PipelineLifetime",
-		opentracing.FollowsFrom(parentSpan.Context()),
-		opentracing.Tag{"pipeline", pipeline})
-
 	// serialize extended trace & write to etcd
 	traceProto := &TraceProto{
 		SerializedTrace: map[string]string{}, // init map
 		Pipeline:        pipeline,
 	}
 	opentracing.GlobalTracer().Inject(
-		extendedSpan.Context(),
-		opentracing.TextMap,
+		span.Context(), opentracing.TextMap,
 		opentracing.TextMapCarrier(traceProto.SerializedTrace),
 	)
 	if _, err := col.NewSTM(ctx, c, func(stm col.STM) error {
@@ -127,21 +121,21 @@ func AddSpanToAnyPipelineTrace(ctx context.Context, c *etcd.Client,
 		return nil, ctx // no Jaeger instance to send trace info to
 	}
 
-	var extendedTrace TraceProto
+	traceProto := &TraceProto{}
 	tracesCol := TracesCol(c).ReadOnly(ctx)
-	if err := tracesCol.Get(pipeline, &extendedTrace); err != nil {
+	if err := tracesCol.Get(pipeline, traceProto); err != nil {
 		if !col.IsErrNotFound(err) {
 			log.Errorf("error getting trace for pipeline %q: %v", pipeline, err)
 		}
 		return nil, ctx
 	}
-	if !extendedTrace.isValid() {
+	if !traceProto.isValid() {
 		return nil, ctx // no trace found
 	}
 
-	// Deserialize opentracing span from 'extendedTrace'
+	// Deserialize opentracing span from 'traceProto'
 	spanCtx, err := opentracing.GlobalTracer().Extract(opentracing.TextMap,
-		opentracing.TextMapCarrier(extendedTrace.SerializedTrace))
+		opentracing.TextMapCarrier(traceProto.SerializedTrace))
 	if err != nil {
 		log.Errorf("could not extract span context from ExtendedTrace proto: %v", err)
 		return nil, ctx
@@ -150,17 +144,17 @@ func AddSpanToAnyPipelineTrace(ctx context.Context, c *etcd.Client,
 	// return new span
 	span, ctx := opentracing.StartSpanFromContext(ctx,
 		operation, opentracing.FollowsFrom(spanCtx),
-		opentracing.Tag{"pipeline", pipeline})
+		opentracing.Tag{Key: "pipeline", Value: pipeline})
 	tracing.TagAnySpan(span, kvs...)
 	return span, ctx
 }
 
-// SetTraceDuration 'ctx' (and returns an augmented context) based on whether
-// the environment variable in 'ExtendedTraceEnvVar' is set.
-// Returns a context that may have the new span attached, and 'true' if an an
-// extended trace was created, or 'false' otherwise. Currently only called by
-// the CreatePipeline cobra command
-func SetTraceDuration(ctx context.Context) (newCtx context.Context, err error) {
+// EmbedAnyDuration augments 'ctx' (and returns a new ctx) based on whether
+// the environment variable in 'ExtendedTraceEnvVar' is set.  Returns a context
+// that may have the new span attached, and 'true' if an an extended trace was
+// created, or 'false' otherwise. Currently only called by the CreatePipeline
+// cobra command
+func EmbedAnyDuration(ctx context.Context) (newCtx context.Context, err error) {
 	duration, ok := os.LookupEnv(TraceDurationEnvVar)
 	if !ok {
 		return ctx, nil // PACH_TRACE_DURATION is not set

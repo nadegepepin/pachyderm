@@ -10,9 +10,9 @@ import (
 	"github.com/pachyderm/pachyderm/src/client/pfs"
 	"github.com/pachyderm/pachyderm/src/client/pkg/errors"
 	"github.com/pachyderm/pachyderm/src/client/pkg/tracing"
-	"github.com/pachyderm/pachyderm/src/client/pkg/tracing/extended"
 	"github.com/pachyderm/pachyderm/src/client/pps"
 	"github.com/pachyderm/pachyderm/src/client/version"
+	"github.com/pachyderm/pachyderm/src/server/pfs/pretty"
 	"github.com/pachyderm/pachyderm/src/server/pkg/backoff"
 	"github.com/pachyderm/pachyderm/src/server/pkg/ppsutil"
 	workerserver "github.com/pachyderm/pachyderm/src/server/worker/server"
@@ -70,7 +70,7 @@ var (
 // 1. retrieves its full pipeline spec and RC
 // 2. makes whatever changes are needed to bring the RC in line with the (new) spec
 // 3. updates 'ptr', if needed, to reflect the action it just took
-func (a *apiServer) step(pachClient *client.APIClient, pipeline string, keyVer, keyRev int64) error {
+func (a *apiServer) step(pachClient *client.APIClient, pipeline string) error {
 	log.Infof("PPS master: processing event for %q", pipeline)
 
 	// Retrieve pipelineInfo from the spec repo
@@ -85,18 +85,6 @@ func (a *apiServer) step(pachClient *client.APIClient, pipeline string, keyVer, 
 	// the pipeline indefinitely)
 	if err := op.getRC(noExpectation); err != nil && !errors.Is(err, errRCNotFound) {
 		return err
-	}
-
-	// Handle tracing
-	span, ctx := extended.AddPipelineSpanToAnyTrace(pachClient.Ctx(),
-		a.env.GetEtcdClient(), pipeline, "/pps.Master/ProcessPipelineUpdate",
-		"key-version", keyVer,
-		"mod-revision", keyRev,
-		"state", op.ptr.State.String(),
-		"spec-commit", op.ptr.SpecCommit)
-	if span != nil {
-		defer tracing.FinishAnySpan(span)
-		pachClient = pachClient.WithCtx(ctx) //lint:ignore SA4006 pachClient is unused but we want the right one in scope in case someone uses it below in the future
 	}
 
 	// Bring 'pipeline' into the correct state by taking appropriate action
@@ -191,6 +179,9 @@ func (a *apiServer) newPipelineOp(pachClient *client.APIClient, pipeline string)
 	if err := op.getPipelineInfo(); err != nil {
 		return nil, err
 	}
+	// Update trace with any new pipeline info from getPipelineInfo()
+	tracing.TagAnySpan(pachClient.Ctx(), "current-state", op.ptr.State.String(),
+		"spec-commit", pretty.CompactPrintCommitSafe(op.ptr.SpecCommit))
 	return op, nil
 }
 

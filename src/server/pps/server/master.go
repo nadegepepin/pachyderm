@@ -53,14 +53,14 @@ func (a *apiServer) master() {
 	backoff.RetryNotify(func() error {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		// Note: 'pachClient' is unauthenticated. This will use the PPS token (via
-		// a.sudo()) to authenticate requests.
-		pachClient := a.env.GetPachClient(ctx)
 		ctx, err := masterLock.Lock(ctx)
 		if err != nil {
 			return err
 		}
 		defer masterLock.Unlock(ctx)
+		// Note: 'pachClient' is unauthenticated. This will use the PPS token (via
+		// a.sudo()) to authenticate requests.
+		pachClient := a.env.GetPachClient(ctx)
 		kubeClient := a.env.GetKubeClient()
 
 		log.Infof("PPS master: launching master process")
@@ -103,10 +103,17 @@ func (a *apiServer) master() {
 				switch event.Type {
 				case watch.EventPut:
 					pipeline := string(event.Key)
+					// Setup trace for processing the pipeline update (while we have etcd
+					// metadata)
+					span, ctx := extended.AddSpanToAnyPipelineTrace(pachClient.Ctx(),
+						a.env.GetEtcdClient(), pipeline, "/pps.Master/ProcessPipelineUpdate",
+						"key-version", event.Ver,
+						"mod-revision", event.Rev)
 					// Create/Modify/Delete pipeline resources as needed per new state
-					if err := a.step(pachClient, pipeline, event.Ver, event.Rev); err != nil {
+					if err := a.step(pachClient.WithCtx(ctx), pipeline); err != nil {
 						log.Errorf("PPS master: %v", err)
 					}
+					tracing.FinishAnySpan(span)
 				}
 			case event := <-watchChan:
 				// if we get an error we restart the watch, k8s watches seem to
@@ -321,14 +328,22 @@ func (a *apiServer) monitorPipeline(pachClient *client.APIClient, pipelineInfo *
 		})
 		eg.Go(func() error {
 			return backoff.RetryNotify(func() error {
-				span, ctx := extended.AddPipelineSpanToAnyTrace(pachClient.Ctx(),
-					a.env.GetEtcdClient(), pipelineInfo.Pipeline.Name, "/pps.Master/MonitorPipeline",
-					"standby", pipelineInfo.Standby)
-				if span != nil {
-					pachClient = pachClient.WithCtx(ctx)
+				var (
+					childSpan     opentracing.Span
+					oldCtx        = pachClient.Ctx()
+					oldPachClient = pachClient
+					ctx           context.Context
+				)
+				defer func() {
+					// childSpan is overwritten so wrap in a lambda for late binding
+					tracing.FinishAnySpan(childSpan)
+				}()
+				childSpan, ctx = extended.AddSpanToAnyPipelineTrace(oldCtx,
+					a.env.GetEtcdClient(), pipelineInfo.Pipeline.Name,
+					"/pps.Master/MonitorPipeline/Begin")
+				if childSpan != nil {
+					pachClient = oldPachClient.WithCtx(ctx)
 				}
-				defer tracing.FinishAnySpan(span)
-
 				if err := a.transitionPipelineState(pachClient.Ctx(),
 					pipelineInfo.Pipeline.Name,
 					pps.PipelineState_PIPELINE_RUNNING,
@@ -345,14 +360,6 @@ func (a *apiServer) monitorPipeline(pachClient *client.APIClient, pipelineInfo *
 					}
 					return err
 				}
-				var (
-					childSpan     opentracing.Span
-					oldCtx        = ctx
-					oldPachClient = pachClient
-				)
-				defer func() {
-					tracing.FinishAnySpan(childSpan) // Finish any dangling children of 'span'
-				}()
 				for {
 					// finish span from previous loops
 					tracing.FinishAnySpan(childSpan)
@@ -364,9 +371,10 @@ func (a *apiServer) monitorPipeline(pachClient *client.APIClient, pipelineInfo *
 						if ci.Finished != nil {
 							continue
 						}
-						childSpan, ctx = tracing.AddSpanToAnyExisting(
-							oldCtx, "/pps.Master/MonitorPipeline_SpinUp",
-							"pipeline", pipelineInfo.Pipeline.Name, "commit", ci.Commit.ID)
+						childSpan, ctx = extended.AddSpanToAnyPipelineTrace(oldCtx,
+							a.env.GetEtcdClient(), pipelineInfo.Pipeline.Name,
+							"/pps.Master/MonitorPipeline/SpinUp",
+							"commit", ci.Commit.ID)
 						if childSpan != nil {
 							pachClient = oldPachClient.WithCtx(ctx)
 						}
@@ -396,8 +404,17 @@ func (a *apiServer) monitorPipeline(pachClient *client.APIClient, pipelineInfo *
 								return err
 							}
 
+							tracing.FinishAnySpan(childSpan)
+							childSpan = nil
 							select {
 							case ci = <-ciChan:
+								childSpan, ctx = extended.AddSpanToAnyPipelineTrace(oldCtx,
+									a.env.GetEtcdClient(), pipelineInfo.Pipeline.Name,
+									"/pps.Master/MonitorPipeline/WatchNext",
+									"commit", ci.Commit.ID)
+								if childSpan != nil {
+									pachClient = oldPachClient.WithCtx(ctx)
+								}
 							default:
 								break running
 							}
